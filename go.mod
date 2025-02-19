@@ -1,3 +1,3 @@
-module 6.824/src
+module 6.824
 
 go 1.23.6

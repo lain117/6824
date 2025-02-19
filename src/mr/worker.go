@@ -1,11 +1,19 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+	"io"
+	"strings"
+	"path/filepath"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
-
 //
 // Map functions return a slice of KeyValue.
 //
@@ -13,7 +21,11 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+type ByKey []KeyValue
 
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -28,36 +40,153 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-	for {
-		taskinfo := CallAskTask()
-		switch taskinfo.State {
-		case TaskMap:
-			workerMap(mapf,taskinfo)
-			break
-		case TaskReduce:
-			workerReduce(reducef,taskinfo)
-			break
-		case TaskWait:
-			time.Sleep(time.Duration(time.Second * 5))
-			break
-		case TaskEnd:
-			fmt.Println("Master all tasks complete. Nothing to do...")
-			return
-		default:
-			panic("Invalid Task state received by worker")
-		}
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	arg1 := AskReduceNumArgs{}
+	reply1 := AskReduceNumReply{}
+	var nReduce int
+	ok := call("Coordinator.AskReduceNum",&arg1,&reply1)
+	if !ok {
+		fmt.Println("ask reduce num err!")
+		return 
 	}
+	nReduce = reply1.ReduceNum
+
+	arg := AskTaskArgs{}
+	reply := AskTaskReply{Task: "", StartReduce: false}
+	ok = call("Coordinator.AskTask",&arg,&reply)
+	if !ok {
+		fmt.Println("ask maptask err!")
+		return 
+	}
+	if reply.Task != "" {
+		filename := reply.Task
+		file,err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := io.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
+		kva := mapf(filename, string(content))
+		
+		tmp := make([][]KeyValue, nReduce)
+		for i := 0; i < nReduce; i++ {
+			tmp[i] = []KeyValue{}
+		}
+		for _,kv := range kva {
+			tmp[ihash(kv.Key)%nReduce] = append(tmp[ihash(kv.Key)%nReduce], kv)
+		}
+		for i, bucket := range tmp {
+			oname := "mr-" + strings.Replace(reply.Task[3:(len(reply.Task)-4)], "-", "_", -1) + "-" + strconv.Itoa(i)
+			ofile, _ := os.CreateTemp(".", oname)
+			enc := json.NewEncoder(ofile)
+			for _, kv := range bucket {
+				if err := enc.Encode(&kv); err != nil {
+					log.Fatalf("cannot write %v", oname)
+				}
+			}
+			os.Rename(ofile.Name(), oname)
+		}
+
+		MapSuccessArgs := MapSuccessArgs{Task: filename}
+		MapSuccessReply := MapSuccessReply{}
+		ok = call("Coordinator.MapSuccess",&MapSuccessArgs,&MapSuccessReply)
+		if !ok {
+			fmt.Println("failed to notice coordinator that map task done !!!!!")
+			return
+		}
+	} else if reply.StartReduce {
+		reducearg := AskReduceArgs{}
+		reducereply := AskReduceNumReply{ReduceNum: -1}
+		ok := call("Coordinator.AskReduce",&reducearg,&reducereply)
+		if !ok {
+			return
+		}
+		if reducereply.ReduceNum < 0 {
+			time.Sleep(5 * time.Second)
+			Worker(mapf,reducef)
+			return
+		}
+		reducereply.ReduceNum -= 1
+		reduceNum := reducereply.ReduceNum
+		dir := "./"
+		suffix := strconv.Itoa(reduceNum)
+		kva := []KeyValue{}
+		intermediate := []KeyValue{}
+		var countA = 0
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && strings.HasSuffix(path, suffix) {
+				file, err := os.Open(path)
+				defer file.Close()
+				if err != nil {
+					//fmt.Printf("os.Open(path) error\n")
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						if err == io.EOF {
+							break
+						}
+						//fmt.Printf("dec.Decode(&kv) error\n")
+						break
+					}
+					if kv.Key == "A" {
+						countA++
+					}
+					kva = append(kva, kv)
+				}
+			}
+			return nil
+		})
+		intermediate = append(intermediate, kva...)
+		// fmt.Println("reduce countA = ", countA)
+		if err != nil {
+			fmt.Println(err)
+		}
+		sort.Sort(ByKey(intermediate))
+		oname := "mr-out-" + strconv.Itoa(reduceNum)
+		ofile, _ := os.CreateTemp(".", oname)
+		i := 0
+		for i < len(intermediate) {
+			j := i + 1
+			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, intermediate[k].Value)
+			}
+			output := reducef(intermediate[i].Key, values)
+
+			// this is the correct format for each line of Reduce output.
+			fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+			i = j
+		}
+
+		os.Rename(ofile.Name(), oname)
+
+		ReduceSuccessArgs := ReduceSuccessArgs{ReduceNum: reduceNum}
+		ReduceSuccessReply := ReduceSuccessReply{}
+		ok = call("Coordinator.ReduceSuccess",&ReduceSuccessArgs,&ReduceSuccessReply)
+		if !ok {
+			fmt.Println("failed to notice reduce task")
+		}
+	} else {
+		//wait for a period of time
+		time.Sleep(1 * time.Second)
+	}
+	Worker(mapf, reducef)
+
 }
 
 //
-// example function to show how to make an RPC call to the master.
+// example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
@@ -73,20 +202,26 @@ func CallExample() {
 	reply := ExampleReply{}
 
 	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	// the "Coordinator.Example" tells the
+	// receiving server that we'd like to call
+	// the Example() method of struct Coordinator.
+	ok := call("Coordinator.Example", &args, &reply)
+	if ok {
+		// reply.Y should be 100.
+		fmt.Printf("reply.Y %v\n", reply.Y)
+	} else {
+		fmt.Printf("call failed!\n")
+	}
 }
 
 //
-// send an RPC request to the master, wait for the response.
+// send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 //
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := masterSock()
+	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
@@ -100,120 +235,4 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
-}
-
-//call task
-func CallAskTask() *TaskInfo {
-	args := ExampleArgs{}
-	reply := TaskInfo{}
-	call("Master.AskTask",&args,&reply)
-	return &reply
-}
-
-func CalltaskDone(taskinfo *TaskInfo) {
-	reply := ExampleReply{}
-	call("Master.AskDone",taskinfo,&reply)
-}
-
-func workerMap(mapf func(string, string) []KeyValue,taskinfo *TaskInfo) {
-	fmt.Println("now worker get a map mission,index is %d,",taskinfo.fileIndex)
-	intermediate := []KeyValue{}
-	file, err := os.Open(taskinfo.FileName)
-	if err != nil {
-		log.Fatalf("cannot open %v", filename)
-	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatalf("cannot read %v", filename)
-	}
-	file.Close()
-	ff := func(r rune) bool { return !unicode.IsLetter(r) }
-	words := strings.FieldsFunc(content, ff)
-	kva := mapf(taskInfo.FileName, string(content))
-	intermediate = append(intermediate, kva...)
-
-	nReduce := taskInfo.NReduce
-	outprefix := "mr-tmp/mr-"
-	outprefix += strconv.Itoa(taskInfo.FileIndex)
-	outprefix += "-"
-	outFiles := make([]*os.File, nReduce)
-	fileEncs := make([]*json.Encoder, nReduce)
-	for outindex := 0; outindex < nReduce; outindex++ {
-		//outname := outprefix + strconv.Itoa(outindex)
-		//outFiles[outindex], _ = os.Create(outname)
-		outFiles[outindex], _ = ioutil.TempFile("mr-tmp", "mr-tmp-*")
-		fileEncs[outindex] = json.NewEncoder(outFiles[outindex])
-	}
-	for _,kv := range intermediate {
-		outindex := ihash(kv.Key) % nReduce
-		file := outFiles[outindex]
-		enc := fileEncs[outindex]
-		err = enc.Encoder(&kv)
-		if err != nil {
-			fmt.Printf("File %v Key %v Value %v Error: %v\n", taskInfo.FileName, kv.Key, kv.Value, err)
-			panic("Json encode failed")
-		}
-	}
-	for outindex, file := range outFiles {
-		outname := outprefix + strconv.Itoa(outindex)
-		oldpath := filepath.Join(file.Name())
-		//fmt.Printf("temp file oldpath %v\n", oldpath)
-		os.Rename(oldpath, outname)
-		file.Close()
-	}
-	// acknowledge master
-	CallTaskDone(taskInfo)
-
-}
-
-func workerReduce(reducef func(string, string) []KeyValue,taskinfo *TaskInfo) {
-	fmt.Println("Got assigned reduce task on part %v\n", taskInfo.PartIndex)
-	outname := "mr-out-" + strconv.Itoa(taskInfo.PartIndex)
-	innameprefix := "mr-tmp/mr-"
-	innamesuffix := "-" + strconv.Itoa(taskInfo.PartIndex)
-	intermediate := []KeyValue{}
-	for index := 0; index < taskinfo.NFiles; index ++ {
-		inname := innameprefix + strconv.Itoa(index) + innamesuffix
-		file, err := os.Open(inname)
-		if err != nil {
-			fmt.Printf("Open intermediate file %v failed: %v\n", inname, err)
-			panic("Open file error")
-		}
-		dec := json.NewDecoder(file)
-		for {
-			var kv KeyValue
-			if err := dec.Decoder(&kv); err != nil {
-				break
-			}
-			intermediate = append(intermediate,kv)
-		}
-		file.Close()
-	}
-	sort.Sort(ByKey(intermediate))
-	ofile, err := ioutil.TempFile("mr-tmp", "mr-*")
-	if err != nil {
-		fmt.Printf("Create output file %v failed: %v\n", outname, err)
-		panic("Create file error")
-	}
-	//fmt.Printf("%v\n", intermediate)
-	i := 0
-	for i < len(intermediate) {
-		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-			j++
-		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
-		}
-		output := reducef(intermediate[i].Key, values)
-
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-
-		i = j
-	}
-	os.Rename(ofile,outname)
-	ofile.Close()
-	CallTaskDone(taskinfo)
 }

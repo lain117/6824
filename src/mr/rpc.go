@@ -23,43 +23,48 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-type TryMapArgs struct {
+type AskTaskArgs struct {
 }
 
-type TryMapReply struct {
-	// if should not run map, run reduce
-	RunMap bool
+type AskTaskReply struct {
+	Task       string
+	StartReduce bool
 }
 
-const (
-	TaskMap    = 0
-	TaskReduce = 1
-	TaskWait   = 2
-	TaskEnd    = 3
-)
+type AskReduceNumArgs struct {
+}
 
-type TaskInfo struct {
-	/*
-		Declared in consts above
-			0  map
-			1  reduce
-			2  wait
-			3  end
-	*/
-	State int
-	FileName  string
-	FileIndex int
-	PartIndex int
-	NReduce int
-	NFiles  int
+type AskReduceNumReply struct {
+	ReduceNum int
+}
+
+type AskReduceArgs struct {
+}
+
+type AskReduceReply struct {
+	ReduceNum int
+}
+
+type MapSuccessArgs struct {
+	Task string
+}
+
+type MapSuccessReply struct {
+}
+
+type ReduceSuccessArgs struct {
+	ReduceNum int
+}
+
+type ReduceSuccessReply struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name
-// in /var/tmp, for the master.
+// in /var/tmp, for the coordinator.
 // Can't use the current directory since
 // Athena AFS doesn't support UNIX-domain sockets.
-func masterSock() string {
-	s := "/var/tmp/824-mr-"
+func coordinatorSock() string {
+	s := "/var/tmp/5840-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
